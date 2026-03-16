@@ -5,23 +5,21 @@ A transformer built from scratch in PyTorch, inspired by [karpathy/nanochat](htt
 ## Setup
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+uv sync
 ```
 
 ## Run
 
 ```bash
 # Run component tests (Phase 1: RMSNorm, Attention, MLP)
-python model.py
+uv run python model.py
 ```
 
 ## Project Structure
 
 ```
 model.py          # All model components (embeddings, attention, MLP, transformer)
-requirements.txt  # torch, numpy, requests
+pyproject.toml    # Project config and dependencies
 ```
 
 More files will be added as we build through the phases:
