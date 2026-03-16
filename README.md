@@ -11,18 +11,31 @@ uv sync
 ## Run
 
 ```bash
-# Run component tests (Phase 1: RMSNorm, Attention, MLP)
+# Test model components
 uv run python model.py
+
+# Test data loading + tokenizer
+uv run python data.py
+
+# Sanity check: overfit one batch (should reach loss < 0.1)
+uv run python train.py --sanity-check
+
+# Train (default: 2000 steps, ~5 min on GPU)
+uv run python train.py
+
+# Train with custom settings
+uv run python train.py --n-embd 128 --n-head 8 --n-layer 6 --max-steps 5000
+
+# Generate text from a trained model
+uv run python generate.py --prompt "ROMEO:" --temperature 0.8 --top-k 50
+uv run python generate.py --temperature 0 --max-tokens 500  # greedy
 ```
 
 ## Project Structure
 
 ```
-model.py          # All model components (embeddings, attention, MLP, transformer)
-pyproject.toml    # Project config and dependencies
+model.py      # GPT model: RMSNorm, CausalSelfAttention, MLP, Block, GPT
+data.py       # Tiny Shakespeare download, character-level tokenizer, batching
+train.py      # Training loop with LR scheduling, eval, checkpoints
+generate.py   # Text generation with temperature + top-k sampling
 ```
-
-More files will be added as we build through the phases:
-- `data.py` — dataset download + tokenizer
-- `train.py` — training loop
-- `generate.py` — text generation / inference

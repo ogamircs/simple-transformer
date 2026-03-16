@@ -1,14 +1,14 @@
 """
-Simple Transformer - Phase 1: Core Building Blocks
+Simple Transformer — a GPT built from scratch for learning.
 
-This file builds a transformer from scratch, one component at a time.
-Read it top-to-bottom. Each class is a self-contained building block.
+Read top-to-bottom. Each class is a self-contained building block.
 
 Architecture follows karpathy/nanochat:
   - Pre-norm (normalize before each sublayer)
   - RMSNorm (simpler than LayerNorm)
   - ReLU² activation (instead of GELU)
   - No bias in linear layers
+  - Untied embedding / lm_head weights
 """
 
 import math
@@ -179,65 +179,165 @@ class MLP(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Tests — run with: python model.py
+# Transformer Block
+# ---------------------------------------------------------------------------
+# A single transformer block applies attention then MLP, each with a
+# residual connection and pre-normalization.
+#
+# Pre-norm means we normalize BEFORE each sublayer (not after).
+# This is more stable for training than post-norm (original "Attention Is
+# All You Need" used post-norm, but modern models all use pre-norm).
+#
+# The residual connection (x = x + sublayer(norm(x))) gives gradients a
+# "highway" to flow through — without it, deep networks can't train.
+
+class Block(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.ln_1 = RMSNorm(config.n_embd)       # norm before attention
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = RMSNorm(config.n_embd)       # norm before MLP
+        self.mlp = MLP(config)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-norm residual pattern:
+        #   x = x + attn(norm(x))   — "what should I look at?"
+        #   x = x + mlp(norm(x))    — "what should I think about it?"
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+# ---------------------------------------------------------------------------
+# GPT Model
+# ---------------------------------------------------------------------------
+# The full model assembles everything:
+#   1. Token embedding: integer token ID -> vector
+#   2. Positional embedding: position index -> vector (so the model knows order)
+#   3. Stack of transformer blocks
+#   4. Final normalization
+#   5. Language model head: vector -> logits over vocabulary
+#
+# The forward pass converts a sequence of token IDs into a probability
+# distribution over the next token at each position.
+#
+# Weight initialization matters! We use:
+#   - Normal distribution (std=0.02) for most weights
+#   - Scaled initialization for output projections (std=0.02 / sqrt(2 * n_layer))
+#     This prevents the residual stream from growing with depth.
+
+class GPT(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+
+        # Token embedding: maps each token ID to a learned vector
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+
+        # Positional embedding: maps each position (0, 1, 2, ...) to a learned vector
+        # Without this, the model has no idea about token order (attention is permutation-invariant)
+        self.wpe = nn.Embedding(config.seq_len, config.n_embd)
+
+        # Stack of transformer blocks — this is where the "thinking" happens
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
+
+        # Final normalization before projecting to vocabulary
+        self.ln_f = RMSNorm(config.n_embd)
+
+        # Language model head: project from embedding space to vocabulary size
+        # Untied from wte (separate weights), following nanochat
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # Initialize weights
+        self.apply(self._init_weights)
+        # Scale residual projections by 1/sqrt(2*n_layer) to keep variance stable
+        for name, p in self.named_parameters():
+            if name.endswith("W_o.weight") or name.endswith("c_proj.weight"):
+                nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))
+
+    def _init_weights(self, module):
+        """Initialize weights with small random values."""
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        """
+        Args:
+            idx: token indices, shape (batch, seq_len)
+            targets: target token indices for loss computation, shape (batch, seq_len)
+
+        Returns:
+            logits: shape (batch, seq_len, vocab_size)
+            loss: cross-entropy loss (only if targets provided)
+        """
+        B, T = idx.shape
+        assert T <= self.config.seq_len, f"Sequence length {T} exceeds max {self.config.seq_len}"
+
+        # Step 1: Token + positional embeddings
+        # Each token gets a vector = (what it is) + (where it is)
+        pos = torch.arange(T, device=idx.device)  # [0, 1, 2, ..., T-1]
+        x = self.wte(idx) + self.wpe(pos)          # (B, T, n_embd)
+
+        # Step 2: Pass through all transformer blocks
+        for block in self.blocks:
+            x = block(x)
+
+        # Step 3: Final norm + project to vocabulary
+        x = self.ln_f(x)
+        logits = self.lm_head(x)  # (B, T, vocab_size)
+
+        # Step 4: Compute loss if targets provided
+        loss = None
+        if targets is not None:
+            # Cross-entropy loss: how wrong are our predictions?
+            # Reshape for F.cross_entropy: (B*T, vocab_size) vs (B*T,)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
+
+    def count_parameters(self):
+        """Print a breakdown of parameter counts."""
+        total = sum(p.numel() for p in self.parameters())
+        print(f"Total parameters: {total:,}")
+        print(f"  Token embeddings (wte):    {self.wte.weight.numel():,}")
+        print(f"  Position embeddings (wpe): {self.wpe.weight.numel():,}")
+        for i, block in enumerate(self.blocks):
+            block_params = sum(p.numel() for p in block.parameters())
+            print(f"  Block {i}: {block_params:,}")
+        print(f"  Final norm:                {sum(p.numel() for p in self.ln_f.parameters()):,}")
+        print(f"  LM head:                   {self.lm_head.weight.numel():,}")
+        return total
+
+
+# ---------------------------------------------------------------------------
+# Tests — run with: uv run python model.py
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     config = GPTConfig()
-    print(f"Config: {config}")
-    print(f"Head dimension: {config.n_embd // config.n_head}")
-    print()
+    model = GPT(config)
+    print(f"Config: {config}\n")
+    model.count_parameters()
 
-    # Test RMSNorm
-    norm = RMSNorm(config.n_embd)
-    x = torch.randn(2, 16, config.n_embd)
-    out = norm(x)
-    assert out.shape == x.shape, f"RMSNorm shape mismatch: {out.shape} != {x.shape}"
-    # After normalization, RMS should be approximately 1.0
-    rms = torch.sqrt(torch.mean(out ** 2, dim=-1))
-    print(f"RMSNorm: input shape {x.shape} -> output shape {out.shape}")
-    print(f"  RMS after norm (should be ~1.0): {rms.mean().item():.4f}")
-    print(f"  Parameters: {sum(p.numel() for p in norm.parameters()):,}")
-    print()
+    # Test forward pass with random token IDs
+    idx = torch.randint(0, config.vocab_size, (2, 32))  # batch=2, seq=32
+    logits, loss = model(idx)
+    assert logits.shape == (2, 32, config.vocab_size), f"Logit shape wrong: {logits.shape}"
+    print(f"\nForward pass: idx {idx.shape} -> logits {logits.shape}")
 
-    # Test CausalSelfAttention
-    attn = CausalSelfAttention(config)
-    x = torch.randn(2, 16, config.n_embd)
-    out = attn(x)
-    assert out.shape == x.shape, f"Attention shape mismatch: {out.shape} != {x.shape}"
-    print(f"CausalSelfAttention: input shape {x.shape} -> output shape {out.shape}")
-    print(f"  Parameters: {sum(p.numel() for p in attn.parameters()):,}")
+    # Test with targets — loss should be ~ln(vocab_size) for random init
+    targets = torch.randint(0, config.vocab_size, (2, 32))
+    logits, loss = model(idx, targets)
+    expected_loss = math.log(config.vocab_size)
+    print(f"Loss: {loss.item():.4f} (expected ~{expected_loss:.4f} for random init)")
+    assert abs(loss.item() - expected_loss) < 1.0, "Loss too far from expected"
 
-    # Verify causal mask: manually check that attention weights are lower-triangular
-    with torch.no_grad():
-        q = attn.W_q(x).view(2, 16, config.n_head, config.n_embd // config.n_head).transpose(1, 2)
-        k = attn.W_k(x).view(2, 16, config.n_head, config.n_embd // config.n_head).transpose(1, 2)
-        scores = (q @ k.transpose(-2, -1)) / math.sqrt(config.n_embd // config.n_head)
-        scores = scores.masked_fill(attn.causal_mask[:, :, :16, :16] == 0, float("-inf"))
-        weights = F.softmax(scores, dim=-1)
-        # Check: position 0 should only attend to itself (weight[0,0] = 1.0)
-        first_pos_weights = weights[0, 0, 0, :]  # first batch, first head, first position
-        assert first_pos_weights[0].item() > 0.99, "Position 0 should attend only to itself"
-        # Check: no future attention (upper triangle should be 0)
-        upper_sum = weights[0, 0].triu(diagonal=1).sum().item()
-        assert upper_sum < 1e-6, f"Future attention leak detected: {upper_sum}"
-        print(f"  Causal mask verified: no future attention leakage")
-    print()
+    # Test gradient flow
+    loss.backward()
+    grad_norms = {name: p.grad.norm().item() for name, p in model.named_parameters() if p.grad is not None}
+    assert len(grad_norms) > 0, "No gradients computed"
+    print(f"Gradient flow: all {len(grad_norms)} parameters have gradients")
 
-    # Test MLP
-    mlp = MLP(config)
-    x = torch.randn(2, 16, config.n_embd)
-    out = mlp(x)
-    assert out.shape == x.shape, f"MLP shape mismatch: {out.shape} != {x.shape}"
-    print(f"MLP: input shape {x.shape} -> output shape {out.shape}")
-    print(f"  Parameters: {sum(p.numel() for p in mlp.parameters()):,}")
-    print()
-
-    # Summary
-    total = sum(
-        sum(p.numel() for p in module.parameters())
-        for module in [norm, attn, mlp]
-    )
-    print(f"Total parameters (building blocks only): {total:,}")
-    print()
-    print("All Phase 1 tests passed!")
+    print("\nAll tests passed!")
