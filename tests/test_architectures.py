@@ -18,8 +18,13 @@ from architectures.qwen import (
     ntk_aware_rope_freqs,
     precompute_rope_freqs,
 )
-from architectures.moe import MoEModel, MoEConfig
-from architectures.sliding_window import SlidingWindowModel, SlidingWindowConfig
+from architectures.moe import MoEModel, MoEConfig, TopKRouter
+from architectures.sliding_window import (
+    SlidingWindowAttention,
+    SlidingWindowModel,
+    SlidingWindowConfig,
+    precompute_rope_freqs as sliding_precompute_rope_freqs,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +166,34 @@ class TestLoss:
         assert loss.item() > 0
         assert loss.item() < 10  # sanity bound
 
+    def test_moe_aux_loss_is_top_k_invariant_for_balanced_routing(self):
+        """Balanced routing should not increase aux loss just because top-k increased."""
+        config = MoEConfig(
+            vocab_size=256,
+            n_embd=64,
+            n_head=4,
+            n_kv_head=2,
+            n_layer=2,
+            seq_len=32,
+            n_experts=4,
+            n_experts_active=2,
+        )
+        router = TopKRouter(config)
+        x = torch.zeros(4, config.n_embd)
+        with torch.no_grad():
+            router.gate.weight.zero_()
+
+        logits = torch.tensor([
+            [5.0, 5.0, 0.0, 0.0],
+            [0.0, 5.0, 5.0, 0.0],
+            [0.0, 0.0, 5.0, 5.0],
+            [5.0, 0.0, 0.0, 5.0],
+        ])
+        router.gate.forward = lambda _: logits
+
+        _, _, aux_loss = router(x)
+        assert aux_loss.item() == pytest.approx(1.0, rel=1e-4)
+
     def test_no_loss_without_targets(self, gpt2):
         model, config = gpt2
         idx = torch.randint(0, config.vocab_size, (2, 32))
@@ -288,6 +321,39 @@ class TestArchitectureProperties:
         model, _ = sliding_window
         block = model.blocks[0]
         assert block.attn.qk_norm is not None, "QK-Norm should be enabled"
+
+    def test_sliding_window_local_attention_avoids_dense_score_matmul(self, monkeypatch):
+        """Local attention should not build a full T x T score matrix."""
+        config = SlidingWindowConfig(
+            vocab_size=256,
+            n_embd=32,
+            n_head=4,
+            n_kv_head=2,
+            n_layer=1,
+            seq_len=8,
+            window_size=3,
+            global_every=99,
+            use_qk_norm=False,
+        )
+        head_dim = config.n_embd // config.n_head
+        cos, sin = sliding_precompute_rope_freqs(head_dim, config.seq_len, config.rope_theta)
+        attn = SlidingWindowAttention(config, cos, sin, is_global=False)
+        x = torch.randn(1, config.seq_len, config.n_embd)
+
+        original_matmul = torch.Tensor.__matmul__
+
+        def guarded_matmul(lhs, rhs):
+            if (
+                lhs.ndim == 4
+                and rhs.ndim == 4
+                and lhs.shape[-2] == config.seq_len
+                and rhs.shape[-1] == config.seq_len
+            ):
+                raise AssertionError("local attention used a dense T x T score matmul")
+            return original_matmul(lhs, rhs)
+
+        monkeypatch.setattr(torch.Tensor, "__matmul__", guarded_matmul)
+        attn(x)
 
     def test_qwen_ntk_rope_scales_beyond_training_length_by_default(self):
         """Extended-context Qwen should not fall back to standard RoPE tables."""

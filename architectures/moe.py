@@ -142,7 +142,7 @@ class TopKRouter(nn.Module):
         # f_i: fraction of tokens where expert i is in the top-k
         # We use a straight-through estimator: create a one-hot mask from indices
         mask = F.one_hot(expert_indices, self.n_experts).sum(dim=1).float()  # (N_tokens, n_experts)
-        f = mask.mean(dim=0)  # fraction of tokens per expert
+        f = mask.mean(dim=0) / self.top_k  # fraction of tokens per expert
 
         # p_i: average router probability per expert (using full softmax, not just top-k)
         p = F.softmax(logits, dim=-1).mean(dim=0)

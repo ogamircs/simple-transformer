@@ -127,6 +127,7 @@ class SlidingWindowAttention(nn.Module):
         self.n_groups = config.n_head // config.n_kv_head
         self.head_dim = config.n_embd // config.n_head
         self.is_global = is_global
+        self.window_size = config.window_size
 
         self.W_q = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False)
         self.W_k = nn.Linear(config.n_embd, config.n_kv_head * self.head_dim, bias=False)
@@ -156,6 +157,25 @@ class SlidingWindowAttention(nn.Module):
 
         self.register_buffer("mask", mask.view(1, 1, config.seq_len, config.seq_len))
 
+    def _local_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """Compute causal sliding-window attention without building a full T x T matrix."""
+        _, _, T, _ = q.shape
+
+        k_padded = F.pad(k, (0, 0, self.window_size - 1, 0))
+        v_padded = F.pad(v, (0, 0, self.window_size - 1, 0))
+        k_windows = k_padded.unfold(2, self.window_size, 1).permute(0, 1, 2, 4, 3)
+        v_windows = v_padded.unfold(2, self.window_size, 1).permute(0, 1, 2, 4, 3)
+
+        offsets = torch.arange(self.window_size, device=q.device)
+        positions = torch.arange(T, device=q.device)
+        valid = offsets.unsqueeze(0) >= (self.window_size - 1 - positions).unsqueeze(1)
+
+        attn = (q.unsqueeze(-2) * k_windows).sum(dim=-1) / math.sqrt(self.head_dim)
+        attn = attn.masked_fill(~valid.view(1, 1, T, self.window_size), float("-inf"))
+        attn = F.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        return (attn.unsqueeze(-1) * v_windows).sum(dim=-2)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
 
@@ -176,13 +196,14 @@ class SlidingWindowAttention(nn.Module):
             k = k.repeat_interleave(self.n_groups, dim=1)
             v = v.repeat_interleave(self.n_groups, dim=1)
 
-        # Attention with appropriate mask (global or sliding window)
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn = attn.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        attn = self.dropout(attn)
-
-        out = attn @ v
+        if self.is_global:
+            attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            attn = attn.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
+            attn = F.softmax(attn, dim=-1)
+            attn = self.dropout(attn)
+            out = attn @ v
+        else:
+            out = self._local_attention(q, k, v)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         out = self.W_o(out)
         return out
