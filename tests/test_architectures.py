@@ -308,13 +308,14 @@ class TestArchitectureProperties:
         assert local_count > 0, "Should have at least one local block"
         assert local_count > global_count, "Should have more local than global blocks"
 
-    def test_sliding_window_mask_blocks_distant(self, sliding_window):
-        """Local attention mask should block distant tokens."""
+    def test_sliding_window_local_blocks_skip_dense_mask(self, sliding_window):
+        """Local sliding-window blocks should not allocate a dense mask tensor."""
         model, config = sliding_window
         local_block = next(b for b in model.blocks if not b.is_global)
-        mask = local_block.attn.mask[0, 0]
-        if config.seq_len > config.window_size:
-            assert mask[-1, 0] == 0, "Sliding window should block distant tokens"
+        assert local_block.attn.mask is None
+
+        global_block = next(b for b in model.blocks if b.is_global)
+        assert global_block.attn.mask is not None
 
     def test_sliding_window_qk_norm(self, sliding_window):
         """Sliding window should have QK-Norm."""

@@ -143,19 +143,12 @@ class SlidingWindowAttention(nn.Module):
         self.register_buffer("rope_cos", cos)
         self.register_buffer("rope_sin", sin)
 
-        # Build the appropriate mask
         if is_global:
             # Standard causal mask
             mask = torch.tril(torch.ones(config.seq_len, config.seq_len))
+            self.register_buffer("mask", mask.view(1, 1, config.seq_len, config.seq_len))
         else:
-            # Sliding window causal mask
-            # Position i can attend to positions max(0, i - window_size) .. i
-            mask = torch.zeros(config.seq_len, config.seq_len)
-            for i in range(config.seq_len):
-                start = max(0, i - config.window_size + 1)
-                mask[i, start:i + 1] = 1.0
-
-        self.register_buffer("mask", mask.view(1, 1, config.seq_len, config.seq_len))
+            self.mask = None
 
     def _local_attention(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """Compute causal sliding-window attention without building a full T x T matrix."""
