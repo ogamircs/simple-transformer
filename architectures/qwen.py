@@ -64,6 +64,7 @@ class QwenConfig:
     rope_theta: float = 10000.0 # RoPE base frequency
     tie_embeddings: bool = True # share wte and lm_head weights
     max_train_len: int = 256    # training length (for LogN scaling reference)
+    ntk_alpha: float = 1.0      # extra RoPE extrapolation factor for long contexts
 
 
 # ---------------------------------------------------------------------------
@@ -143,11 +144,18 @@ def ntk_aware_rope_freqs(head_dim: int, seq_len: int, max_train_len: int,
     When seq_len > max_train_len, the base is scaled up to preserve
     local resolution while extending global position coverage.
     """
-    if seq_len > max_train_len and alpha > 1.0:
+    if seq_len > max_train_len:
         # Scale the base frequency using the NTK-aware formula
         scale = alpha * seq_len / max_train_len - (alpha - 1)
         theta = theta * (scale ** (head_dim / (head_dim - 2)))
     return precompute_rope_freqs(head_dim, seq_len, theta)
+
+
+def logn_attention_scale(seq_len: int, max_train_len: int) -> float:
+    """Scale attention only when decoding past the training context."""
+    if seq_len <= 1 or max_train_len <= 1:
+        return 1.0
+    return max(1.0, math.log(seq_len) / math.log(max_train_len))
 
 
 # ---------------------------------------------------------------------------
@@ -215,9 +223,7 @@ class QwenAttention(nn.Module):
 
         # LOGN SCALING: compensate for attention entropy increasing with length
         # At training length -> factor is 1.0. Longer -> factor > 1.0.
-        if T > 1 and self.max_train_len > 1:
-            logn_scale = math.log(T) / math.log(self.max_train_len)
-            attn = attn * logn_scale
+        attn = attn * logn_attention_scale(T, self.max_train_len)
 
         attn = attn.masked_fill(self.causal_mask[:, :, :T, :T] == 0, float("-inf"))
         attn = F.softmax(attn, dim=-1)
@@ -286,7 +292,11 @@ class Qwen(nn.Module):
         # Precompute RoPE frequencies (with NTK-aware scaling if needed)
         head_dim = config.n_embd // config.n_head
         cos, sin = ntk_aware_rope_freqs(
-            head_dim, config.seq_len, config.max_train_len, config.rope_theta
+            head_dim,
+            config.seq_len,
+            config.max_train_len,
+            config.rope_theta,
+            config.ntk_alpha,
         )
 
         # Stack of transformer blocks

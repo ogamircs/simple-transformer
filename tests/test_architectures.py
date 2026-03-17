@@ -11,7 +11,12 @@ import pytest
 
 from architectures.gpt2 import GPT2, GPT2Config
 from architectures.llama import Llama, LlamaConfig
-from architectures.qwen import Qwen, QwenConfig
+from architectures.qwen import (
+    Qwen,
+    QwenConfig,
+    logn_attention_scale,
+    precompute_rope_freqs,
+)
 from architectures.moe import MoEModel, MoEConfig
 from architectures.sliding_window import SlidingWindowModel, SlidingWindowConfig
 
@@ -282,6 +287,56 @@ class TestArchitectureProperties:
         model, _ = sliding_window
         block = model.blocks[0]
         assert block.attn.qk_norm is not None, "QK-Norm should be enabled"
+
+    def test_qwen_ntk_rope_scales_beyond_training_length_by_default(self):
+        """Extended-context Qwen should not fall back to standard RoPE tables."""
+        config = QwenConfig(
+            vocab_size=256,
+            n_embd=64,
+            n_head=4,
+            n_kv_head=2,
+            n_layer=1,
+            seq_len=512,
+            max_train_len=256,
+        )
+        model = Qwen(config)
+        head_dim = config.n_embd // config.n_head
+        standard_cos, _ = precompute_rope_freqs(head_dim, config.seq_len, config.rope_theta)
+        assert not torch.allclose(model.blocks[0].attn.rope_cos, standard_cos)
+
+    def test_qwen_ntk_alpha_changes_rope_tables(self):
+        """Changing NTK alpha should change the extrapolated RoPE tables."""
+        base = QwenConfig(
+            vocab_size=256,
+            n_embd=64,
+            n_head=4,
+            n_kv_head=2,
+            n_layer=1,
+            seq_len=512,
+            max_train_len=256,
+            ntk_alpha=1.0,
+        )
+        scaled = QwenConfig(
+            vocab_size=256,
+            n_embd=64,
+            n_head=4,
+            n_kv_head=2,
+            n_layer=1,
+            seq_len=512,
+            max_train_len=256,
+            ntk_alpha=2.0,
+        )
+        base_model = Qwen(base)
+        scaled_model = Qwen(scaled)
+        assert not torch.allclose(base_model.blocks[0].attn.rope_cos, scaled_model.blocks[0].attn.rope_cos)
+
+    def test_qwen_logn_scaling_clamps_short_context(self):
+        """LogN scaling should not shrink attention scores below training-time behavior."""
+        assert logn_attention_scale(seq_len=32, max_train_len=256) == 1.0
+
+    def test_qwen_logn_scaling_grows_for_long_context(self):
+        """LogN scaling should increase for longer-than-training contexts."""
+        assert logn_attention_scale(seq_len=512, max_train_len=256) > 1.0
 
 
 # ---------------------------------------------------------------------------
