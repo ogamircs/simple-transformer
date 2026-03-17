@@ -145,6 +145,10 @@ def ntk_aware_rope_freqs(head_dim: int, seq_len: int, max_train_len: int,
     local resolution while extending global position coverage.
     """
     if seq_len > max_train_len:
+        if head_dim <= 2:
+            # The NTK exponent is undefined at head_dim == 2; tiny configs
+            # fall back to standard RoPE instead of crashing.
+            return precompute_rope_freqs(head_dim, seq_len, theta)
         # Scale the base frequency using the NTK-aware formula
         scale = alpha * seq_len / max_train_len - (alpha - 1)
         theta = theta * (scale ** (head_dim / (head_dim - 2)))
@@ -184,6 +188,8 @@ class QwenAttention(nn.Module):
         self.n_groups = config.n_head // config.n_kv_head
         self.head_dim = config.n_embd // config.n_head
         self.max_train_len = config.max_train_len
+        self.rope_theta = config.rope_theta
+        self.ntk_alpha = config.ntk_alpha
 
         # SELECTIVE BIAS: QKV have bias=True, output has bias=False
         self.W_q = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=True)
@@ -201,6 +207,19 @@ class QwenAttention(nn.Module):
         causal_mask = torch.tril(torch.ones(config.seq_len, config.seq_len))
         self.register_buffer("causal_mask", causal_mask.view(1, 1, config.seq_len, config.seq_len))
 
+    def _rope_tables(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        if seq_len <= self.max_train_len:
+            return self.rope_cos[:seq_len], self.rope_sin[:seq_len]
+
+        cos, sin = ntk_aware_rope_freqs(
+            self.head_dim,
+            seq_len,
+            self.max_train_len,
+            self.rope_theta,
+            self.ntk_alpha,
+        )
+        return cos.to(device), sin.to(device)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
 
@@ -210,8 +229,9 @@ class QwenAttention(nn.Module):
         v = self.W_v(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
         # Apply RoPE to Q and K
-        q = apply_rope(q, self.rope_cos, self.rope_sin)
-        k = apply_rope(k, self.rope_cos, self.rope_sin)
+        rope_cos, rope_sin = self._rope_tables(T, x.device)
+        q = apply_rope(q, rope_cos, rope_sin)
+        k = apply_rope(k, rope_cos, rope_sin)
 
         # Expand K,V to match Q heads by repeating each KV head n_groups times
         if self.n_groups > 1:
@@ -289,15 +309,10 @@ class Qwen(nn.Module):
         # Token embedding only — RoPE handles position
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
 
-        # Precompute RoPE frequencies (with NTK-aware scaling if needed)
+        # Precompute standard RoPE tables. NTK scaling is selected at runtime
+        # so short inputs stay equivalent to training-length behavior.
         head_dim = config.n_embd // config.n_head
-        cos, sin = ntk_aware_rope_freqs(
-            head_dim,
-            config.seq_len,
-            config.max_train_len,
-            config.rope_theta,
-            config.ntk_alpha,
-        )
+        cos, sin = precompute_rope_freqs(head_dim, config.seq_len, config.rope_theta)
 
         # Stack of transformer blocks
         self.blocks = nn.ModuleList([

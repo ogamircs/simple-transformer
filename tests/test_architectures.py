@@ -15,6 +15,7 @@ from architectures.qwen import (
     Qwen,
     QwenConfig,
     logn_attention_scale,
+    ntk_aware_rope_freqs,
     precompute_rope_freqs,
 )
 from architectures.moe import MoEModel, MoEConfig
@@ -290,6 +291,37 @@ class TestArchitectureProperties:
 
     def test_qwen_ntk_rope_scales_beyond_training_length_by_default(self):
         """Extended-context Qwen should not fall back to standard RoPE tables."""
+        config = QwenConfig(seq_len=512, max_train_len=256)
+        head_dim = config.n_embd // config.n_head
+        ntk_cos, _ = ntk_aware_rope_freqs(
+            head_dim, config.seq_len, config.max_train_len, config.rope_theta, config.ntk_alpha
+        )
+        standard_cos, _ = precompute_rope_freqs(head_dim, config.seq_len, config.rope_theta)
+        assert not torch.allclose(ntk_cos, standard_cos)
+
+    def test_qwen_ntk_alpha_changes_rope_tables(self):
+        """Changing NTK alpha should change the extrapolated RoPE tables."""
+        config = QwenConfig(
+            seq_len=512,
+            max_train_len=256,
+        )
+        head_dim = config.n_embd // config.n_head
+        base_cos, _ = ntk_aware_rope_freqs(
+            head_dim, config.seq_len, config.max_train_len, config.rope_theta, alpha=1.0
+        )
+        scaled_cos, _ = ntk_aware_rope_freqs(
+            head_dim, config.seq_len, config.max_train_len, config.rope_theta, alpha=2.0
+        )
+        assert not torch.allclose(base_cos, scaled_cos)
+
+    def test_qwen_ntk_rope_handles_head_dim_two(self):
+        """Tiny educational configs should not crash when head_dim == 2."""
+        cos, _ = ntk_aware_rope_freqs(head_dim=2, seq_len=32, max_train_len=16)
+        standard_cos, _ = precompute_rope_freqs(head_dim=2, seq_len=32)
+        assert torch.allclose(cos, standard_cos)
+
+    def test_qwen_uses_standard_rope_tables_for_short_runtime_inputs(self):
+        """Short runtime inputs should start from standard RoPE tables."""
         config = QwenConfig(
             vocab_size=256,
             n_embd=64,
@@ -302,33 +334,7 @@ class TestArchitectureProperties:
         model = Qwen(config)
         head_dim = config.n_embd // config.n_head
         standard_cos, _ = precompute_rope_freqs(head_dim, config.seq_len, config.rope_theta)
-        assert not torch.allclose(model.blocks[0].attn.rope_cos, standard_cos)
-
-    def test_qwen_ntk_alpha_changes_rope_tables(self):
-        """Changing NTK alpha should change the extrapolated RoPE tables."""
-        base = QwenConfig(
-            vocab_size=256,
-            n_embd=64,
-            n_head=4,
-            n_kv_head=2,
-            n_layer=1,
-            seq_len=512,
-            max_train_len=256,
-            ntk_alpha=1.0,
-        )
-        scaled = QwenConfig(
-            vocab_size=256,
-            n_embd=64,
-            n_head=4,
-            n_kv_head=2,
-            n_layer=1,
-            seq_len=512,
-            max_train_len=256,
-            ntk_alpha=2.0,
-        )
-        base_model = Qwen(base)
-        scaled_model = Qwen(scaled)
-        assert not torch.allclose(base_model.blocks[0].attn.rope_cos, scaled_model.blocks[0].attn.rope_cos)
+        assert torch.allclose(model.blocks[0].attn.rope_cos, standard_cos)
 
     def test_qwen_logn_scaling_clamps_short_context(self):
         """LogN scaling should not shrink attention scores below training-time behavior."""
