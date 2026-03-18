@@ -8,3 +8,6 @@ dependencies = [
     "numpy",
     "requests",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest"]
