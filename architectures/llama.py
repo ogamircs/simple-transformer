@@ -86,11 +86,18 @@ class RMSNorm(nn.Module):
 #   - Dimension 0,1: rotates fast (high frequency, local patterns)
 #   - Dimension d-2,d-1: rotates slow (low frequency, global patterns)
 
+def validate_rope_head_dim(head_dim: int) -> None:
+    """RoPE rotates pairs of features, so each head needs an even width."""
+    if head_dim % 2 != 0:
+        raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
+
+
 def precompute_rope_freqs(head_dim: int, seq_len: int, theta: float = 10000.0):
     """Precompute the complex exponentials for RoPE.
 
     Returns cos and sin tensors of shape (seq_len, head_dim // 2).
     """
+    validate_rope_head_dim(head_dim)
     # Frequencies for each dimension pair: theta^(-2i/d) for i in [0, d/2)
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
     # Outer product with positions gives the rotation angles
@@ -160,6 +167,7 @@ class GroupedQueryAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_groups = config.n_head // config.n_kv_head  # queries per KV group
         self.head_dim = config.n_embd // config.n_head
+        validate_rope_head_dim(self.head_dim)
 
         # Q has n_head projections, K and V have n_kv_head (fewer!)
         self.W_q = nn.Linear(config.n_embd, config.n_head * self.head_dim, bias=False)

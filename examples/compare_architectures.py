@@ -62,19 +62,9 @@ def train_steps(model, n_steps=200, batch_size=4, seq_len=64, vocab_size=256, lr
     return losses
 
 
-def main():
-    print("=" * 70)
-    print("Architecture Comparison")
-    print("=" * 70)
-
-    # Same embedding size for fair comparison
-    n_embd = 64
-    n_layer = 4
-    seq_len = 128
-    vocab_size = 256
-
-    # Create models
-    models = {
+def build_models(n_embd, n_layer, seq_len, vocab_size):
+    """Build all models with the shared comparison hyperparameters."""
+    return {
         "GPT-2": GPT2(GPT2Config(
             vocab_size=vocab_size, n_embd=n_embd, n_head=4,
             n_layer=n_layer, seq_len=seq_len,
@@ -94,10 +84,24 @@ def main():
         )),
         "SlidWin": SlidingWindowModel(SlidingWindowConfig(
             vocab_size=vocab_size, n_embd=n_embd, n_head=4, n_kv_head=2,
-            n_layer=6, seq_len=seq_len,
+            n_layer=n_layer, seq_len=seq_len,
             window_size=64, global_every=3, use_qk_norm=True,
         )),
     }
+
+
+def main():
+    print("=" * 70)
+    print("Architecture Comparison")
+    print("=" * 70)
+
+    # Same embedding size for fair comparison
+    n_embd = 64
+    n_layer = 4
+    seq_len = 128
+    vocab_size = 256
+
+    models = build_models(n_embd, n_layer, seq_len, vocab_size)
 
     # --- Parameter counts ---
     print("\n1. Parameter Counts")

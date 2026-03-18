@@ -5,6 +5,9 @@ Run with: uv run python -m pytest tests/ -v
 """
 
 import math
+from pathlib import Path
+import subprocess
+import sys
 
 import torch
 import pytest
@@ -193,6 +196,20 @@ class TestLoss:
 
         _, _, aux_loss = router(x)
         assert aux_loss.item() == pytest.approx(1.0, rel=1e-4)
+
+    def test_moe_forward_avoids_tensor_item_in_aux_accumulation(self, moe, monkeypatch):
+        """MoE forward should not force Python-side scalar extraction per layer."""
+        model, config = moe
+        idx = torch.randint(0, config.vocab_size, (2, 16))
+        targets = torch.randint(0, config.vocab_size, (2, 16))
+
+        def fail_item(_):
+            raise AssertionError("MoE forward called Tensor.item() during aux-loss accumulation")
+
+        monkeypatch.setattr(torch.Tensor, "item", fail_item)
+        logits, loss = model(idx, targets)
+        assert logits.shape == (2, 16, config.vocab_size)
+        assert loss is not None
 
     def test_no_loss_without_targets(self, gpt2):
         model, config = gpt2
@@ -410,6 +427,60 @@ class TestArchitectureProperties:
     def test_qwen_logn_scaling_grows_for_long_context(self):
         """LogN scaling should increase for longer-than-training contexts."""
         assert logn_attention_scale(seq_len=512, max_train_len=256) > 1.0
+
+    def test_rope_models_require_even_head_dim(self):
+        """RoPE-based models should fail fast on odd head dimensions."""
+        with pytest.raises(ValueError, match="even head_dim"):
+            Llama(LlamaConfig(vocab_size=256, n_embd=30, n_head=6, n_kv_head=2, n_layer=1, seq_len=32))
+
+        with pytest.raises(ValueError, match="even head_dim"):
+            Qwen(QwenConfig(vocab_size=256, n_embd=30, n_head=6, n_kv_head=2, n_layer=1, seq_len=32))
+
+        with pytest.raises(ValueError, match="even head_dim"):
+            MoEModel(
+                MoEConfig(
+                    vocab_size=256,
+                    n_embd=30,
+                    n_head=6,
+                    n_kv_head=2,
+                    n_layer=2,
+                    n_dense_layers=1,
+                    seq_len=32,
+                )
+            )
+
+        with pytest.raises(ValueError, match="even head_dim"):
+            SlidingWindowModel(
+                SlidingWindowConfig(
+                    vocab_size=256,
+                    n_embd=30,
+                    n_head=6,
+                    n_kv_head=2,
+                    n_layer=2,
+                    seq_len=32,
+                    window_size=8,
+                    global_every=2,
+                )
+            )
+
+    def test_compare_architectures_uses_shared_layer_count(self):
+        """The comparison example should keep the sliding-window baseline on the shared depth."""
+        from examples.compare_architectures import build_models
+
+        models = build_models(n_embd=64, n_layer=4, seq_len=128, vocab_size=256)
+        assert models["SlidWin"].config.n_layer == 4
+
+    def test_sliding_window_module_self_test_runs(self):
+        """The documented sliding-window module self-test should complete successfully."""
+        repo_root = Path(__file__).resolve().parents[1]
+        result = subprocess.run(
+            [sys.executable, "-m", "architectures.sliding_window"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
 
 
 # ---------------------------------------------------------------------------

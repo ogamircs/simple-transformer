@@ -91,6 +91,8 @@ def precompute_rope_freqs(head_dim: int, seq_len: int, theta: float = 10000.0):
 
     Returns cos and sin tensors of shape (seq_len, head_dim // 2).
     """
+    if head_dim % 2 != 0:
+        raise ValueError(f"RoPE requires an even head_dim, got {head_dim}")
     freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
     t = torch.arange(seq_len).float()
     angles = torch.outer(t, freqs)  # (seq_len, head_dim // 2)
@@ -187,6 +189,8 @@ class QwenAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_groups = config.n_head // config.n_kv_head
         self.head_dim = config.n_embd // config.n_head
+        if self.head_dim % 2 != 0:
+            raise ValueError(f"RoPE requires an even head_dim, got {self.head_dim}")
         self.max_train_len = config.max_train_len
         self.rope_theta = config.rope_theta
         self.ntk_alpha = config.ntk_alpha

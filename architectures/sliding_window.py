@@ -46,6 +46,7 @@ from architectures.llama import (
     precompute_rope_freqs,
     apply_rope,
     LlamaConfig,
+    validate_rope_head_dim,
 )
 
 
@@ -126,6 +127,7 @@ class SlidingWindowAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_groups = config.n_head // config.n_kv_head
         self.head_dim = config.n_embd // config.n_head
+        validate_rope_head_dim(self.head_dim)
         self.is_global = is_global
         self.window_size = config.window_size
 
@@ -336,15 +338,11 @@ if __name__ == "__main__":
         pattern.append(kind)
     print(f"\nAttention pattern: {' -> '.join(pattern)}")
 
-    # Verify the sliding window mask restricts attention
+    # Verify local blocks use the optimized windowed path
     local_block = model.blocks[0]
     assert not local_block.is_global
-    mask = local_block.attn.mask[0, 0]
-    # For a local block, the last row should NOT attend to position 0
-    # (if seq_len > window_size)
-    if config.seq_len > config.window_size:
-        assert mask[-1, 0] == 0, "Sliding window mask should block distant tokens"
-        print(f"Sliding window: position {config.seq_len-1} correctly blocked from position 0")
+    assert local_block.attn.mask is None, "Local sliding-window blocks should skip the dense mask"
+    print("Sliding window: local blocks use the optimized no-dense-mask path")
 
     # Verify the global mask allows full attention
     global_block = model.blocks[config.global_every - 1]

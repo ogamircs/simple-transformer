@@ -281,6 +281,7 @@ class MoEModel(nn.Module):
     def __init__(self, config: MoEConfig):
         super().__init__()
         self.config = config
+        self.n_moe_layers = max(0, config.n_layer - config.n_dense_layers)
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
 
@@ -318,14 +319,11 @@ class MoEModel(nn.Module):
         x = self.wte(idx)
 
         # Accumulate auxiliary losses from MoE layers
-        total_aux_loss = torch.tensor(0.0, device=idx.device)
-        n_moe_layers = 0
+        total_aux_loss = x.new_zeros(())
 
         for block in self.blocks:
             x, aux_loss = block(x)
-            if aux_loss.item() > 0:
-                total_aux_loss = total_aux_loss + aux_loss
-                n_moe_layers += 1
+            total_aux_loss = total_aux_loss + aux_loss
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -334,8 +332,8 @@ class MoEModel(nn.Module):
         if targets is not None:
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
             # Add load-balancing loss (averaged over MoE layers)
-            if n_moe_layers > 0:
-                avg_aux_loss = total_aux_loss / n_moe_layers
+            if self.n_moe_layers > 0:
+                avg_aux_loss = total_aux_loss / self.n_moe_layers
                 loss = ce_loss + self.config.aux_loss_weight * avg_aux_loss
             else:
                 loss = ce_loss
